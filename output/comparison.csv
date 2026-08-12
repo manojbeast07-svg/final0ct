@@ -1,0 +1,5 @@
+stage,file,mae,psnr,ssim
+Gaussian Blur,gaussian_cpu_run.png,0.461039,45.019391,0.994327
+Histogram EQ,histogram_cpu_run.png,79.020195,9.032058,0.358912
+Sharpen,sharpen_cpu_run.png,79.066292,9.018031,0.334988
+Edge Detect,edge_cpu_run.png,50.119316,9.374063,0.183679
