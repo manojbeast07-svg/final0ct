@@ -1,6 +1,4 @@
-<<<<<<< HEAD
-# usecase11
-=======
+# ClearScan
 # ClearScan
 
 Pipeline that takes raw X-ray image and produced enhanced version where bones are sharper, edges are more defined, and abnormalities are clear. 
@@ -138,3 +136,6 @@ CS/EE 147 - GPU Programming
 
 Spring 2026
 >>>>>>> 9cf7ec9 (Initial project import)
+=======
+
+>>>>>>> fc9b5ea (Create README.md)
