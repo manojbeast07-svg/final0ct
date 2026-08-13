@@ -50,7 +50,9 @@ STAGE_LABELS = {
     "edge_ms": "Edge Detection",
 }
 
-st.title("ClearScan: CPU vs GPU pipeline comparison")
+# Streamlit app configuration and title
+st.set_page_config(page_title="Streamlit Clear Scan", layout="wide")
+st.title("Streamlit Clear Scan")
 
 uploaded = st.file_uploader("Upload an X-ray image (PNG/JPG)", type=["png", "jpg", "jpeg"])
 samples = [p.name for p in DATA_DIR.rglob('*.png')] + [p.name for p in DATA_DIR.rglob('*.jpg')]

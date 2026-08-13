@@ -1,5 +1,4 @@
-# ClearScan
-# ClearScan
+# Streamlit Clear Scan
 
 Pipeline that takes raw X-ray image and produced enhanced version where bones are sharper, edges are more defined, and abnormalities are clear. 
 
