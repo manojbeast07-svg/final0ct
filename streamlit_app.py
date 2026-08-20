@@ -490,10 +490,10 @@ if st.button("Run CPU" ):
     st.success("CPU pipeline completed")
     st.write(cpu_times)
     cols = st.columns(4)
-    cols[0].image(str(OUTPUT_DIR / 'gaussian_cpu.png'), caption='Gaussian (CPU)')
-    cols[1].image(str(OUTPUT_DIR / 'histogram_cpu.png'), caption='Histogram EQ (CPU)')
-    cols[2].image(str(OUTPUT_DIR / 'sharpen_cpu.png'), caption='Sharpen (CPU)')
-    cols[3].image(str(OUTPUT_DIR / 'edge_cpu.png'), caption='Edge (CPU)')
+    cols[0].image(str(CPU_OUTPUT_DIR / 'gaussian_cpu.png'), caption='Gaussian (CPU)')
+    cols[1].image(str(CPU_OUTPUT_DIR / 'histogram_cpu.png'), caption='Histogram EQ (CPU)')
+    cols[2].image(str(CPU_OUTPUT_DIR / 'sharpen_cpu.png'), caption='Sharpen (CPU)')
+    cols[3].image(str(CPU_OUTPUT_DIR / 'edge_cpu.png'), caption='Edge (CPU)')
 
 cpu_times = st.session_state.cpu_times
 
@@ -688,7 +688,7 @@ if st.button("Run GPU now"):
         ]
         report = []
         for cpu_name, gpu_name, key in mapping:
-            cpu_p = OUTPUT_DIR / cpu_name
+            cpu_p = CPU_OUTPUT_DIR / cpu_name
             gpu_p = OUTPUT_DIR / gpu_name
             if cpu_p.exists() and gpu_p.exists():
                 a = load_gray(cpu_p)
