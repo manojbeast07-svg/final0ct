@@ -54,6 +54,8 @@ STAGE_LABELS = {
 
 st.title("ClearScan: CPU vs GPU pipeline comparison")
 
+
+
 # Sidebar controls for interactivity
 st.sidebar.header("Run controls")
 repeats = st.sidebar.slider("CUDA samples (repeats)", min_value=1, max_value=10, value=3)
@@ -66,6 +68,17 @@ uploaded_bin_sidebar = st.sidebar.file_uploader("Upload GPU binary (optional)", 
 binary_path_input = st.sidebar.text_input("GPU binary path (optional)", value=str(ROOT / "clearscan"))
 run_button = st.sidebar.button("Run Selected Pipelines")
 live_preview = st.sidebar.button("Live CPU Preview")
+use_saved_report = st.sidebar.checkbox("Show saved pipeline_report.json", value=False)
+if st.sidebar.button("Delete saved pipeline_report.json"):
+    rpt = ROOT / 'pipeline_report.json'
+    try:
+        if rpt.exists():
+            rpt.unlink()
+            st.sidebar.success('Deleted pipeline_report.json')
+        else:
+            st.sidebar.info('No pipeline_report.json to delete')
+    except Exception as _e:
+        st.sidebar.error(f'Could not delete report: {_e}')
 
 uploaded = st.file_uploader("Upload an X-ray image (PNG/JPG)", type=["png", "jpg", "jpeg"])
 samples = [p.name for p in DATA_DIR.rglob('*.png')] + [p.name for p in DATA_DIR.rglob('*.jpg')]
@@ -76,11 +89,22 @@ else:
     choice = "-- none --"
 
 if uploaded is None and choice == "-- none --":
-    st.info("Upload an image or select a sample to begin.")
-    st.stop()
+    st.info("No image selected — showing last CPU outputs if available.")
 
 # Ensure output directory exists
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# If CPU output images already exist (e.g. from an external run), show them so the UI isn't empty
+if CPU_OUTPUT_DIR.exists() and any(CPU_OUTPUT_DIR.glob('*_cpu.png')):
+    st.subheader("Last CPU outputs")
+    cols = st.columns(4)
+    cpu_imgs = ['gaussian_cpu.png', 'histogram_cpu.png', 'sharpen_cpu.png', 'edge_cpu.png']
+    for i, name in enumerate(cpu_imgs):
+        p = CPU_OUTPUT_DIR / name
+        if p.exists():
+            cols[i].image(str(p), caption=name.replace('_cpu.png', ' (CPU)'))
+        else:
+            cols[i].warning(f"Missing: {name}")
 
 if uploaded:
     input_path = RUNTIME_DIR / "inputs" / Path(uploaded.name).name
@@ -88,7 +112,17 @@ if uploaded:
     with open(input_path, "wb") as f:
         f.write(uploaded.read())
 else:
-    input_path = next(DATA_DIR.rglob(choice))
+    if choice == "-- none --":
+        sample_jpg = next(DATA_DIR.rglob('*.jpg'), None)
+        sample_png = next(DATA_DIR.rglob('*.png'), None)
+        fallback = sample_jpg or sample_png
+        if fallback:
+            input_path = fallback
+        else:
+            st.warning("No sample images found and no upload provided.")
+            st.stop()
+    else:
+        input_path = next(DATA_DIR.rglob(choice))
 
 st.write("Input:", input_path.name)
 st.image(str(input_path), width="stretch")
@@ -96,6 +130,51 @@ st.image(str(input_path), width="stretch")
 # area for logs and progress
 log_area = st.empty()
 progress_bar = st.progress(0)
+
+REPORT_PATH = ROOT / 'pipeline_report.json'
+if use_saved_report and REPORT_PATH.exists():
+    try:
+        import json as _json
+        with open(REPORT_PATH, 'r') as _f:
+            _report = _json.load(_f)
+        st.header('Last pipeline comparison (GPU1 vs GPU Enhanced)')
+        # build rows for table
+        rows = []
+        for stage in ['gaussian','histogram','sharpen','edge']:
+            gpu1_ms = None
+            enh_ms = None
+            if isinstance(_report.get('gpu1'), dict):
+                gpu1_ms = _report['gpu1'].get(f'{stage}_ms') or _report['gpu1'].get(stage + '_ms')
+            if isinstance(_report.get('enhanced'), dict):
+                enh_ms = _report['enhanced'].get(f'{stage}_ms') or _report['enhanced'].get(stage + '_ms')
+            # metrics under metrics -> gpu1/enhanced
+            metrics = _report.get('metrics', {})
+            gpu1_metrics = metrics.get('gpu1', {}).get(stage, {}) if isinstance(metrics, dict) else {}
+            enh_metrics = metrics.get('enhanced', {}).get(stage, {}) if isinstance(metrics, dict) else {}
+            # prefer GPU1 metrics for MAE/PSNR/SSIM if available
+            mae = gpu1_metrics.get('mae') or enh_metrics.get('mae')
+            psnr = gpu1_metrics.get('psnr') or enh_metrics.get('psnr')
+            ssim_val = gpu1_metrics.get('ssim') or enh_metrics.get('ssim')
+            rows.append({'stage': stage, 'gpu1_ms': gpu1_ms, 'enhanced_ms': enh_ms, 'mae': mae, 'psnr': psnr, 'ssim': ssim_val})
+        st.table(rows)
+
+        # show side-by-side images for each stage if available
+        st.subheader('Per-stage images')
+        for stage in ['gaussian','histogram','sharpen','edge']:
+            g1p = ROOT / 'temp_gpu1_outputs' / f'{stage}_0.png'
+            enhp = ROOT / 'temp_enhanced_outputs' / f'{stage}_0.png'
+            if g1p.exists() or enhp.exists():
+                cols = st.columns(2)
+                if g1p.exists():
+                    cols[0].image(str(g1p), caption=f'GPU1 {stage}')
+                else:
+                    cols[0].write('GPU1 image missing')
+                if enhp.exists():
+                    cols[1].image(str(enhp), caption=f'GPU Enhanced {stage}')
+                else:
+                    cols[1].write('GPU Enhanced image missing')
+    except Exception as _ex:
+        st.warning(f'Could not read pipeline_report.json: {_ex}')
 
 def time_cpu_pipeline(path):
     img = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
@@ -345,6 +424,64 @@ if should_run:
         progress_bar.progress(100)
     st.session_state.last_image_id = image_id
 
+# Comparison tables: CPU vs GPU1, and GPU1 vs GPU Enhanced
+st.header('Comparison tables')
+cpu_times_state = st.session_state.get('cpu_times')
+gpu1_state = st.session_state.get('gpu1_stats')
+enh_state = st.session_state.get('gpu_enhanced_stats')
+report_data = None
+if (ROOT / 'pipeline_report.json').exists():
+    try:
+        import json as _json
+        report_data = _json.load(open(ROOT / 'pipeline_report.json'))
+    except Exception:
+        report_data = None
+
+st.subheader('CPU vs GPU1')
+rows = []
+for stage_key, label, cpu_name, gpu_name, stat_key in STAGE_FILES:
+    cpu_ms = None
+    gpu1_ms = None
+    # try session_state first
+    if cpu_times_state and stat_key in cpu_times_state:
+        cpu_ms = float(cpu_times_state[stat_key])
+    elif report_data and 'cpu_mean_ms' in report_data:
+        cpu_ms = float(report_data['cpu_mean_ms'])
+    if gpu1_state and stat_key in gpu1_state:
+        gpu1_ms = float(gpu1_state[stat_key])
+    elif report_data and isinstance(report_data.get('gpu1'), dict):
+        gpu1_ms = float(report_data['gpu1'].get(stat_key)) if report_data['gpu1'].get(stat_key) is not None else None
+    speed = None
+    if cpu_ms and gpu1_ms:
+        try:
+            speed = f"{(cpu_ms / gpu1_ms):.2f}x"
+        except Exception:
+            speed = None
+    rows.append({'stage': label, 'cpu_ms': cpu_ms, 'gpu1_ms': gpu1_ms, 'speedup': speed})
+st.table(rows)
+
+st.subheader('GPU1 vs GPU Enhanced')
+rows2 = []
+for stage_key, label, cpu_name, gpu_name, stat_key in STAGE_FILES:
+    g1 = None
+    enh = None
+    if gpu1_state and stat_key in gpu1_state:
+        g1 = float(gpu1_state[stat_key])
+    elif report_data and isinstance(report_data.get('gpu1'), dict):
+        g1 = float(report_data['gpu1'].get(stat_key)) if report_data['gpu1'].get(stat_key) is not None else None
+    if enh_state and stat_key in enh_state:
+        enh = float(enh_state[stat_key])
+    elif report_data and isinstance(report_data.get('enhanced'), dict):
+        enh = float(report_data['enhanced'].get(stat_key)) if report_data['enhanced'].get(stat_key) is not None else None
+    ratio = None
+    if g1 and enh:
+        try:
+            ratio = f"{(g1 / enh):.2f}x"
+        except Exception:
+            ratio = None
+    rows2.append({'stage': label, 'gpu1_ms': g1, 'enhanced_ms': enh, 'ratio': ratio})
+st.table(rows2)
+
 # Live CPU preview action
 if live_preview:
     # show controls for preview
@@ -357,10 +494,12 @@ if live_preview:
         time_cpu_preview(input_path, sigma=sigma, sharpen_strength=sharpen_strength, edge_threshold=edge_threshold)
     st.success("Preview updated")
     cols = st.columns(4)
-    cols[0].image(str(CPU_OUTPUT_DIR / 'gaussian_cpu.png'), caption='Gaussian (CPU preview)')
-    cols[1].image(str(CPU_OUTPUT_DIR / 'histogram_cpu.png'), caption='Histogram EQ (CPU preview)')
-    cols[2].image(str(CPU_OUTPUT_DIR / 'sharpen_cpu.png'), caption='Sharpen (CPU preview)')
-    cols[3].image(str(CPU_OUTPUT_DIR / 'edge_cpu.png'), caption='Edge (CPU preview)')
+    preview_imgs = [CPU_OUTPUT_DIR / 'gaussian_cpu.png', CPU_OUTPUT_DIR / 'histogram_cpu.png', CPU_OUTPUT_DIR / 'sharpen_cpu.png', CPU_OUTPUT_DIR / 'edge_cpu.png']
+    for i, p in enumerate(preview_imgs):
+        if p.exists():
+            cols[i].image(str(p), caption=p.name.replace('_cpu.png',' (CPU preview)'))
+        else:
+            cols[i].warning(f"Missing preview: {p.name}")
 
 cpu_times = st.session_state.get("cpu_times")
 gpu_versions = {
@@ -490,10 +629,12 @@ if st.button("Run CPU" ):
     st.success("CPU pipeline completed")
     st.write(cpu_times)
     cols = st.columns(4)
-    cols[0].image(str(CPU_OUTPUT_DIR / 'gaussian_cpu.png'), caption='Gaussian (CPU)')
-    cols[1].image(str(CPU_OUTPUT_DIR / 'histogram_cpu.png'), caption='Histogram EQ (CPU)')
-    cols[2].image(str(CPU_OUTPUT_DIR / 'sharpen_cpu.png'), caption='Sharpen (CPU)')
-    cols[3].image(str(CPU_OUTPUT_DIR / 'edge_cpu.png'), caption='Edge (CPU)')
+    cpu_imgs = [CPU_OUTPUT_DIR / 'gaussian_cpu.png', CPU_OUTPUT_DIR / 'histogram_cpu.png', CPU_OUTPUT_DIR / 'sharpen_cpu.png', CPU_OUTPUT_DIR / 'edge_cpu.png']
+    for i, p in enumerate(cpu_imgs):
+        if p.exists():
+            cols[i].image(str(p), caption=p.name.replace('_cpu.png',' (CPU)'))
+        else:
+            cols[i].warning(f"Missing: {p.name}")
 
 cpu_times = st.session_state.cpu_times
 
