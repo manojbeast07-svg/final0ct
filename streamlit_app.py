@@ -65,6 +65,7 @@ show_logs = st.sidebar.checkbox("Show verbose logs", value=False)
 uploaded_bin_sidebar = st.sidebar.file_uploader("Upload GPU binary (optional)", type=None)
 binary_path_input = st.sidebar.text_input("GPU binary path (optional)", value=str(ROOT / "clearscan"))
 run_button = st.sidebar.button("Run Selected Pipelines")
+live_preview = st.sidebar.button("Live CPU Preview")
 
 uploaded = st.file_uploader("Upload an X-ray image (PNG/JPG)", type=["png", "jpg", "jpeg"])
 samples = [p.name for p in DATA_DIR.rglob('*.png')] + [p.name for p in DATA_DIR.rglob('*.jpg')]
@@ -151,6 +152,54 @@ def time_cpu_pipeline_average(path, repeats=5):
         averaged[key] = float(np.mean([sample[key] for sample in samples]))
     averaged["sample_count"] = repeats
     return averaged
+
+
+def time_cpu_preview(path, sigma=0.85, sharpen_strength=1.0, edge_threshold=0):
+    """Quick CPU preview that uses adjustable parameters and writes CPU_OUTPUT_DIR images."""
+    img = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+    CPU_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Gaussian with adjustable sigma
+    t0 = time.perf_counter()
+    g = cv2.GaussianBlur(img, (3, 3), sigma)
+    t1 = time.perf_counter()
+    cv2.imwrite(str(CPU_OUTPUT_DIR / 'gaussian_cpu.png'), g)
+
+    # Histogram equalization
+    eq = cv2.equalizeHist(g)
+    cv2.imwrite(str(CPU_OUTPUT_DIR / 'histogram_cpu.png'), eq)
+
+    # Sharpen: scale the kernel center by sharpen_strength
+    kernel = np.array([
+        [-0.25 * sharpen_strength, -0.5 * sharpen_strength, -0.25 * sharpen_strength],
+        [-0.5 * sharpen_strength, 4.0 * sharpen_strength, -0.5 * sharpen_strength],
+        [-0.25 * sharpen_strength, -0.5 * sharpen_strength, -0.25 * sharpen_strength]
+    ], dtype=np.float32)
+    sharpen = cv2.filter2D(eq, cv2.CV_8U, kernel, borderType=cv2.BORDER_REPLICATE)
+    cv2.imwrite(str(CPU_OUTPUT_DIR / 'sharpen_cpu.png'), sharpen)
+
+    # Edge detection (Sobel) and optional thresholding
+    sob = cv2.Sobel(sharpen, cv2.CV_16S, 1, 1, ksize=3)
+    sob_abs = cv2.convertScaleAbs(sob)
+    if edge_threshold > 0:
+        _, sob_thr = cv2.threshold(sob_abs, int(edge_threshold), 255, cv2.THRESH_BINARY)
+        sob_out = sob_thr
+    else:
+        sob_out = sob_abs
+    cv2.imwrite(str(CPU_OUTPUT_DIR / 'edge_cpu.png'), sob_out)
+
+    # Combined preview
+    combined_width = img.shape[1] * 2
+    combined_height = img.shape[0] * 2
+    combined = np.zeros((combined_height, combined_width), dtype=np.uint8)
+    combined[:img.shape[0], :img.shape[1]] = g
+    combined[:img.shape[0], img.shape[1]:] = eq
+    combined[img.shape[0]:, :img.shape[1]] = sharpen
+    combined[img.shape[0]:, img.shape[1]:] = sob_out
+    cv2.imwrite(str(CPU_OUTPUT_DIR / 'preview.png'), combined)
+    return {
+        'gaussian_ms': (t1 - t0) * 1000.0,
+    }
 
 
 def format_bytes(value: float) -> str:
@@ -295,6 +344,23 @@ if should_run:
         }
         progress_bar.progress(100)
     st.session_state.last_image_id = image_id
+
+# Live CPU preview action
+if live_preview:
+    # show controls for preview
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("Preview parameters")
+    sigma = st.sidebar.slider("Gaussian sigma", 0.1, 3.0, 0.85, 0.05)
+    sharpen_strength = st.sidebar.slider("Sharpen strength", 0.1, 3.0, 1.0, 0.1)
+    edge_threshold = st.sidebar.slider("Edge threshold (0 = none)", 0, 255, 0)
+    with st.spinner("Running CPU preview..."):
+        time_cpu_preview(input_path, sigma=sigma, sharpen_strength=sharpen_strength, edge_threshold=edge_threshold)
+    st.success("Preview updated")
+    cols = st.columns(4)
+    cols[0].image(str(CPU_OUTPUT_DIR / 'gaussian_cpu.png'), caption='Gaussian (CPU preview)')
+    cols[1].image(str(CPU_OUTPUT_DIR / 'histogram_cpu.png'), caption='Histogram EQ (CPU preview)')
+    cols[2].image(str(CPU_OUTPUT_DIR / 'sharpen_cpu.png'), caption='Sharpen (CPU preview)')
+    cols[3].image(str(CPU_OUTPUT_DIR / 'edge_cpu.png'), caption='Edge (CPU preview)')
 
 cpu_times = st.session_state.get("cpu_times")
 gpu_versions = {
