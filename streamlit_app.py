@@ -5,6 +5,8 @@ import subprocess
 import time
 import os
 import tempfile
+import zipfile
+import io
 from pathlib import Path
 from skimage.metrics import structural_similarity as ssim
 from timing_utils import STAGE_KEYS, parse_gpu_timing_output, build_gpu_stats_from_cpu, summarize_gpu_comparison, summarize_previous_gpu_vs_cpu
@@ -50,9 +52,19 @@ STAGE_LABELS = {
     "edge_ms": "Edge Detection",
 }
 
-# Streamlit app configuration and title
-st.set_page_config(page_title="Streamlit Clear Scan", layout="wide")
-st.title("Streamlit Clear Scan")
+st.title("ClearScan: CPU vs GPU pipeline comparison")
+
+# Sidebar controls for interactivity
+st.sidebar.header("Run controls")
+repeats = st.sidebar.slider("CUDA samples (repeats)", min_value=1, max_value=10, value=3)
+run_cpu_checkbox = st.sidebar.checkbox("Run CPU baseline", value=True)
+run_gpu1_checkbox = st.sidebar.checkbox("Run GPU1 (simple CUDA)", value=True)
+run_enhanced_checkbox = st.sidebar.checkbox("Run GPU Enhanced (optimized CUDA)", value=True)
+auto_run = st.sidebar.checkbox("Auto-run on image select", value=False)
+show_logs = st.sidebar.checkbox("Show verbose logs", value=False)
+uploaded_bin_sidebar = st.sidebar.file_uploader("Upload GPU binary (optional)", type=None)
+binary_path_input = st.sidebar.text_input("GPU binary path (optional)", value=str(ROOT / "clearscan"))
+run_button = st.sidebar.button("Run Selected Pipelines")
 
 uploaded = st.file_uploader("Upload an X-ray image (PNG/JPG)", type=["png", "jpg", "jpeg"])
 samples = [p.name for p in DATA_DIR.rglob('*.png')] + [p.name for p in DATA_DIR.rglob('*.jpg')]
@@ -79,6 +91,10 @@ else:
 
 st.write("Input:", input_path.name)
 st.image(str(input_path), width="stretch")
+
+# area for logs and progress
+log_area = st.empty()
+progress_bar = st.progress(0)
 
 def time_cpu_pipeline(path):
     img = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
@@ -194,43 +210,90 @@ def output_metrics(cpu_path, gpu_path):
 st.header("Automatic CPU vs GPU demonstration")
 st.caption("Selecting one image runs the CPU baseline, simple CUDA GPU1, and optimized CUDA GPU Enhanced pipelines.")
 image_id = f"{input_path.resolve()}:{input_path.stat().st_mtime_ns}"
-if (
+
+# Decide whether to run automatically or on user request
+should_run = run_button or (auto_run and (
     st.session_state.get("last_image_id") != image_id
     or st.session_state.get("gpu1_stats") is None
     or st.session_state.get("gpu_enhanced_stats") is None
-):
-    with st.spinner("Running CPU, GPU1, and GPU Enhanced..."):
-        cpu_times = time_cpu_pipeline_average(input_path)
-        st.session_state.cpu_times = cpu_times
+))
+
+if should_run:
+    with st.spinner("Running selected pipelines..."):
+        progress_bar.progress(5)
+        # CPU
+        if run_cpu_checkbox:
+            cpu_times = time_cpu_pipeline_average(input_path, repeats=repeats)
+            st.session_state.cpu_times = cpu_times
+        else:
+            cpu_times = st.session_state.get("cpu_times")
+        progress_bar.progress(30)
+
+        # Prepare run path
         run_path = RUNTIME_DIR / "gpu" / input_path.name
         run_path.parent.mkdir(parents=True, exist_ok=True)
         run_path.write_bytes(input_path.read_bytes())
 
+        # Determine executable paths (allow sidebar override/upload)
         gpu1_path = ROOT / ("gpu1.exe" if os.name == "nt" and (ROOT / "gpu1.exe").exists() else "gpu1")
         enhanced_path = ROOT / ("clearscan.exe" if os.name == "nt" and (ROOT / "clearscan.exe").exists() else "clearscan")
-        if gpu1_path.exists() and enhanced_path is not None and enhanced_path.exists():
-            gpu1_stats, gpu1_output = run_cuda_binary_average(gpu1_path, run_path)
-            enhanced_stats, enhanced_output = run_cuda_binary_average(enhanced_path, run_path)
-            GPU1_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        # Uploaded binary overrides
+        if uploaded_bin_sidebar is not None:
+            bin_path = ROOT / uploaded_bin_sidebar.name
+            with open(bin_path, 'wb') as f:
+                f.write(uploaded_bin_sidebar.read())
+            os.chmod(bin_path, 0o755)
+            enhanced_path = bin_path
+            gpu1_path = bin_path
+        # Text input override
+        if binary_path_input:
+            candidate = Path(binary_path_input)
+            if candidate.exists():
+                enhanced_path = candidate
+                gpu1_path = candidate
+
+        # Run GPU1 and Enhanced as requested
+        GPU1_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        gpu1_stats = None
+        enhanced_stats = None
+        st.session_state.gpu1_output = None
+        st.session_state.gpu_enhanced_output = None
+
+        # Run GPU1
+        if run_gpu1_checkbox and gpu1_path.exists():
+            progress_bar.progress(50)
+            gpu1_stats, gpu1_output = run_cuda_binary_average(gpu1_path, run_path, repeats=repeats)
+            st.session_state.gpu1_stats = gpu1_stats
+            st.session_state.gpu1_output = gpu1_output
+            # copy stage images
             for stage_name in ("gaussian", "histogram", "sharpen", "edge"):
                 source = OUTPUT_DIR / f"gpu1_{stage_name}.png"
                 target = GPU1_OUTPUT_DIR / f"{stage_name}.png"
                 if source.exists():
                     target.write_bytes(source.read_bytes())
-            st.session_state.gpu1_stats = gpu1_stats
-            st.session_state.gpu_enhanced_stats = enhanced_stats
-            st.session_state.gpu1_output = gpu1_output
-            st.session_state.gpu_enhanced_output = enhanced_output
-            st.session_state.comparison_history[image_id] = {
-                "image": input_path.name,
-                "cpu_ms": cpu_times,
-                "gpu1": gpu1_stats,
-                "gpu_enhanced": enhanced_stats,
-            }
         else:
             st.session_state.gpu1_stats = None
+
+        progress_bar.progress(75)
+
+        # Run enhanced GPU
+        if run_enhanced_checkbox and enhanced_path.exists():
+            enhanced_stats, enhanced_output = run_cuda_binary_average(enhanced_path, run_path, repeats=repeats)
+            st.session_state.gpu_enhanced_stats = enhanced_stats
+            st.session_state.gpu_enhanced_output = enhanced_output
+        else:
             st.session_state.gpu_enhanced_stats = None
-            st.warning("Build both CUDA versions first: `make` for GPU Enhanced and `make gpu1` for GPU1.")
+
+        progress_bar.progress(95)
+
+        # Store comparison history
+        st.session_state.comparison_history[image_id] = {
+            "image": input_path.name,
+            "cpu_ms": cpu_times,
+            "gpu1": st.session_state.get("gpu1_stats"),
+            "gpu_enhanced": st.session_state.get("gpu_enhanced_stats"),
+        }
+        progress_bar.progress(100)
     st.session_state.last_image_id = image_id
 
 cpu_times = st.session_state.get("cpu_times")
@@ -367,6 +430,26 @@ if st.button("Run CPU" ):
     cols[3].image(str(OUTPUT_DIR / 'edge_cpu.png'), caption='Edge (CPU)')
 
 cpu_times = st.session_state.cpu_times
+
+# Optional verbose logs
+if show_logs:
+    st.subheader("GPU logs")
+    gpu1_out = st.session_state.get("gpu1_output") or ""
+    enhanced_out = st.session_state.get("gpu_enhanced_output") or ""
+    st.text_area("GPU1 output", value=gpu1_out, height=200)
+    st.text_area("GPU Enhanced output", value=enhanced_out, height=200)
+
+# Download outputs as ZIP
+if st.button("Prepare outputs ZIP"):
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, 'w') as z:
+        for f in OUTPUT_DIR.glob('*.png'):
+            z.writestr(f.name, f.read_bytes())
+        cpu_preview = CPU_OUTPUT_DIR / 'preview.png'
+        if cpu_preview.exists():
+            z.writestr('cpu_preview.png', cpu_preview.read_bytes())
+    buf.seek(0)
+    st.download_button("Download outputs as ZIP", data=buf.getvalue(), file_name=f"{input_path.stem}_outputs.zip", mime="application/zip")
 
 st.header("Run GPU pipeline (clearscan binary)")
 exe_name = 'clearscan.exe' if os.name == 'nt' else 'clearscan'
