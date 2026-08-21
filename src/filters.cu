@@ -20,6 +20,31 @@ static __device__ __forceinline__ uint8_t read_pixel(const uint8_t* __restrict__
     return __ldg(&in[y * width + x]);
 }
 
+static __device__ __forceinline__ uint8_t read_pixel_direct(const uint8_t* in, int x, int y, int width, int height) {
+    x = clamp_coord(x, 0, width - 1);
+    y = clamp_coord(y, 0, height - 1);
+    return in[y * width + x];
+}
+
+static __device__ __forceinline__ uint8_t pixel_fast(const uint8_t* in, int x, int y, int width, int height) {
+    x = max(0, min(width - 1, x));
+    y = max(0, min(height - 1, y));
+    return in[y * width + x];
+}
+
+static __device__ __forceinline__ int round_div4(int value) {
+    return value >= 0 ? (value + 2) / 4 : (value - 2) / 4;
+}
+
+static __device__ __forceinline__ uint8_t sharpen_pixel_direct(const uint8_t* in, int x, int y, int width, int height) {
+    int corners = pixel_fast(in, x - 1, y - 1, width, height) + pixel_fast(in, x + 1, y - 1, width, height)
+        + pixel_fast(in, x - 1, y + 1, width, height) + pixel_fast(in, x + 1, y + 1, width, height);
+    int edges = pixel_fast(in, x, y - 1, width, height) + pixel_fast(in, x - 1, y, width, height)
+        + pixel_fast(in, x + 1, y, width, height) + pixel_fast(in, x, y + 1, width, height);
+    int value = round_div4(-corners - 2 * edges + 16 * pixel_fast(in, x, y, width, height));
+    return (uint8_t)min(max(value, 0), 255);
+}
+
 __constant__ float GAUSSIAN_MASK[3][3] = {
     {1/16.f, 2/16.f, 1/16.f},
     {2/16.f, 4/16.f, 2/16.f},
@@ -107,11 +132,11 @@ __global__ void gaussian_direct(const uint8_t* __restrict__ in, uint8_t* __restr
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= width || y >= height) return;
-    int sum = read_pixel(in, x - 1, y - 1, width, height) + read_pixel(in, x + 1, y - 1, width, height)
-        + read_pixel(in, x - 1, y + 1, width, height) + read_pixel(in, x + 1, y + 1, width, height)
-        + 2 * (read_pixel(in, x, y - 1, width, height) + read_pixel(in, x - 1, y, width, height)
-        + read_pixel(in, x + 1, y, width, height) + read_pixel(in, x, y + 1, width, height))
-        + 4 * read_pixel(in, x, y, width, height);
+    int sum = read_pixel_direct(in, x - 1, y - 1, width, height) + read_pixel_direct(in, x + 1, y - 1, width, height)
+        + read_pixel_direct(in, x - 1, y + 1, width, height) + read_pixel_direct(in, x + 1, y + 1, width, height)
+        + 2 * (read_pixel_direct(in, x, y - 1, width, height) + read_pixel_direct(in, x - 1, y, width, height)
+        + read_pixel_direct(in, x + 1, y, width, height) + read_pixel_direct(in, x, y + 1, width, height))
+        + 4 * read_pixel_direct(in, x, y, width, height);
     out[y * width + x] = (uint8_t)((sum + 8) >> 4);
 }
 
@@ -145,6 +170,44 @@ __global__ void buildHistogram(uint8_t* in, int* histogram, int n_pixels){
     }
 }
 
+__global__ void buildHistogramGlobal(const uint8_t* in, int* histogram, int n_pixels){
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = blockDim.x * gridDim.x;
+    while (i < n_pixels) {
+        atomicAdd(&histogram[in[i]], 1);
+        i += stride;
+    }
+}
+
+__global__ void buildHistogramWarpPrivate(const uint8_t* in, int* histogram, int n_pixels){
+    constexpr int WARP_COUNT = 256 / 32;
+    __shared__ unsigned int warp_histogram[WARP_COUNT][256];
+
+    int warp = threadIdx.x >> 5;
+    for (int bin = threadIdx.x; bin < WARP_COUNT * 256; bin += blockDim.x) {
+        warp_histogram[bin / 256][bin % 256] = 0;
+    }
+    __syncthreads();
+
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = blockDim.x * gridDim.x;
+    while (index < n_pixels) {
+        atomicAdd(&warp_histogram[warp][in[index]], 1);
+        index += stride;
+    }
+    __syncthreads();
+
+    if (threadIdx.x < 256) {
+        unsigned int total = 0;
+        for (int source_warp = 0; source_warp < WARP_COUNT; ++source_warp) {
+            total += warp_histogram[source_warp][threadIdx.x];
+        }
+        if (total != 0) {
+            atomicAdd(&histogram[threadIdx.x], total);
+        }
+    }
+}
+
 /*
     Applying the histogram to the image and change the pixels
     each thread reads one pixel, looks up the new value in the lookup table, writes it to the image
@@ -154,6 +217,20 @@ __global__ void applyEqualization(uint8_t* in, uint8_t* out, uint8_t* lut, int n
     if(idx >= n_pixels) return;
 
     out[idx] = lut[in[idx]]; 
+}
+
+__global__ void sharpen_global(const uint8_t* __restrict__ in, uint8_t* __restrict__ out, int width, int height){
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= width || y >= height) return;
+
+    int corners = pixel_fast(in, x - 1, y - 1, width, height) + pixel_fast(in, x + 1, y - 1, width, height)
+        + pixel_fast(in, x - 1, y + 1, width, height) + pixel_fast(in, x + 1, y + 1, width, height);
+    int edges = pixel_fast(in, x, y - 1, width, height) + pixel_fast(in, x - 1, y, width, height)
+        + pixel_fast(in, x + 1, y, width, height) + pixel_fast(in, x, y + 1, width, height);
+    int scaled_sum = -corners - 2 * edges + 16 * pixel_fast(in, x, y, width, height);
+    int result = round_div4(scaled_sum);
+    out[y * width + x] = (uint8_t)min(max(result, 0), 255);
 }
 
 /*
@@ -187,18 +264,12 @@ __global__ void sharpen_direct(const uint8_t* __restrict__ in, uint8_t* __restri
 
     if (x >= width || y >= height) return;
 
-    float sum = 0.0f;
-    sum += SHARPEN_MASK[0][0] * tile[ty + 0][tx + 0];
-    sum += SHARPEN_MASK[0][1] * tile[ty + 0][tx + 1];
-    sum += SHARPEN_MASK[0][2] * tile[ty + 0][tx + 2];
-    sum += SHARPEN_MASK[1][0] * tile[ty + 1][tx + 0];
-    sum += SHARPEN_MASK[1][1] * tile[ty + 1][tx + 1];
-    sum += SHARPEN_MASK[1][2] * tile[ty + 1][tx + 2];
-    sum += SHARPEN_MASK[2][0] * tile[ty + 2][tx + 0];
-    sum += SHARPEN_MASK[2][1] * tile[ty + 2][tx + 1];
-    sum += SHARPEN_MASK[2][2] * tile[ty + 2][tx + 2];
-
-    int result = (int)roundf(sum);
+    int corners = tile[ty + 0][tx + 0] + tile[ty + 0][tx + 2]
+        + tile[ty + 2][tx + 0] + tile[ty + 2][tx + 2];
+    int edges = tile[ty + 0][tx + 1] + tile[ty + 1][tx + 0]
+        + tile[ty + 1][tx + 2] + tile[ty + 2][tx + 1];
+    int scaled_sum = -corners - 2 * edges + 16 * tile[ty + 1][tx + 1];
+    int result = round_div4(scaled_sum);
     out[y * width + x] = (uint8_t)min(max(result, 0), 255);
 }
 
@@ -255,6 +326,54 @@ __global__ void edgeDetect(const uint8_t* __restrict__ in, uint8_t* __restrict__
     out[y * width + x] = (uint8_t)min(max(sum, 0), 255);
 }
 
+__global__ void edge_direct(const uint8_t* __restrict__ in, uint8_t* __restrict__ out, int width, int height){
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= width || y >= height) return;
+    int value = pixel_fast(in, x - 1, y - 1, width, height)
+        - pixel_fast(in, x + 1, y - 1, width, height)
+        - pixel_fast(in, x - 1, y + 1, width, height)
+        + pixel_fast(in, x + 1, y + 1, width, height);
+    out[y * width + x] = (uint8_t)min(max(value, 0), 255);
+}
+
+static __device__ __forceinline__ uint8_t sharpen_tile_pixel(const uint8_t* tile, int center, int stride) {
+    int corners = tile[center - stride - 1] + tile[center - stride + 1]
+        + tile[center + stride - 1] + tile[center + stride + 1];
+    int edges = tile[center - stride] + tile[center - 1]
+        + tile[center + 1] + tile[center + stride];
+    int value = round_div4(-corners - 2 * edges + 16 * tile[center]);
+    return (uint8_t)min(max(value, 0), 255);
+}
+
+__global__ void sharpen_edge_fused(const uint8_t* __restrict__ in, uint8_t* __restrict__ sharpened, uint8_t* __restrict__ edge, int width, int height){
+    __shared__ uint8_t tile[20][20];
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    int base_x = blockIdx.x * blockDim.x - 2;
+    int base_y = blockIdx.y * blockDim.y - 2;
+    bool interior = base_x >= 0 && base_y >= 0 && base_x + 19 < width && base_y + 19 < height;
+    for (int row = threadIdx.y; row < 20; row += blockDim.y) {
+        for (int col = threadIdx.x; col < 20; col += blockDim.x) {
+            int source_x = base_x + col;
+            int source_y = base_y + row;
+            tile[row][col] = interior
+                ? in[source_y * width + source_x]
+                : pixel_fast(in, source_x, source_y, width, height);
+        }
+    }
+    __syncthreads();
+    if (x >= width || y >= height) return;
+
+    int center = (threadIdx.y + 2) * 20 + threadIdx.x + 2;
+    sharpened[y * width + x] = sharpen_tile_pixel(&tile[0][0], center, 20);
+    int value = sharpen_tile_pixel(&tile[0][0], center - 20 - 1, 20)
+        - sharpen_tile_pixel(&tile[0][0], center - 20 + 1, 20)
+        - sharpen_tile_pixel(&tile[0][0], center + 20 - 1, 20)
+        + sharpen_tile_pixel(&tile[0][0], center + 20 + 1, 20);
+    edge[y * width + x] = (uint8_t)min(max(value, 0), 255);
+}
+
 
 // ------------------------------------------
 // KERNEL CALLS
@@ -266,6 +385,8 @@ void launchGaussian(uint8_t* d_in, uint8_t* d_out, int width, int height)
         ((width + BLOCK_DIM_X - 1) / BLOCK_DIM_X),
         ((height + BLOCK_DIM_Y - 1) / BLOCK_DIM_Y)
     );
+    // Direct coalesced reads avoid tile setup for typical sub-2MP X-rays;
+    // shared-memory tiling is reserved for workloads large enough to amortize it.
     if ((size_t)width * (size_t)height < 2u * 1024u * 1024u) {
         dim3 direct_threads(16, 16);
         dim3 direct_blocks((width + 15) / 16, (height + 15) / 16);
@@ -279,6 +400,19 @@ void launchGaussian(uint8_t* d_in, uint8_t* d_out, int width, int height)
 void launchHistogram(uint8_t* d_in, int* d_hist, int n_pixels){
     int threads = 256;
     int blocks = (n_pixels + threads - 1) / threads;
+    // Global atomics have the lowest setup cost for small and medium images;
+    // use the privatized strategy only once enough pixels amortize its setup.
+    if (n_pixels < 700 * 1024) {
+        blocks = min(blocks, 1024);
+        buildHistogramGlobal<<<blocks, threads>>>(d_in, d_hist, n_pixels);
+        return;
+    }
+    if (n_pixels < 2 * 1024 * 1024) {
+        blocks = min(blocks, 32);
+        buildHistogramWarpPrivate<<<blocks, threads>>>(d_in, d_hist, n_pixels);
+        return;
+    }
+    blocks = min(blocks, 256);
     buildHistogram<<<blocks, threads>>>(d_in, d_hist, n_pixels);
 }
 
@@ -296,17 +430,21 @@ void launchSharpen(uint8_t* d_in, uint8_t* d_out, int width, int height)
         ((width + BLOCK_DIM_X - 1) / BLOCK_DIM_X),
         ((height + BLOCK_DIM_Y - 1) / BLOCK_DIM_Y)
     );
-    sharpen_direct<<<blocks, threads>>>(d_in, d_out, width, height);
+    if ((size_t)width * (size_t)height < 2u * 1024u * 1024u) {
+        dim3 direct_threads(16, 16);
+        dim3 direct_blocks((width + 15) / 16, (height + 15) / 16);
+        sharpen_global<<<direct_blocks, direct_threads>>>(d_in, d_out, width, height);
+    } else {
+        sharpen_direct<<<blocks, threads>>>(d_in, d_out, width, height);
+    }
 }
 
 void launchEdgeDetect(uint8_t* d_in, uint8_t* d_out, int width, int height)
 {
-    dim3 threads(BLOCK_DIM_X, BLOCK_DIM_Y);
-    dim3 blocks(
-        ((width + BLOCK_DIM_X - 1) / BLOCK_DIM_X),
-        ((height + BLOCK_DIM_Y - 1) / BLOCK_DIM_Y)
-    );
-    edgeDetect<<<blocks, threads>>>(d_in, d_out, width, height);
+    // Keep Enhanced Edge algorithmically identical to GPU1 Edge.
+    dim3 threads(16, 16);
+    dim3 blocks((width + 15) / 16, (height + 15) / 16);
+    edge_direct<<<blocks, threads>>>(d_in, d_out, width, height);
 }
 
 // CPU Baseline Filter Functions:
@@ -372,4 +510,11 @@ double cpu_histogram_opencv(const char* filename) {
     equalizeHist(blurred, out);
     auto end = high_resolution_clock::now();
     return duration<double, std::milli>(end - start).count();
+}
+
+void launchSharpenEdgeFused(uint8_t* d_in, uint8_t* d_sharpened, uint8_t* d_edge, int width, int height)
+{
+    dim3 threads(16, 16);
+    dim3 blocks((width + 15) / 16, (height + 15) / 16);
+    sharpen_edge_fused<<<blocks, threads>>>(d_in, d_sharpened, d_edge, width, height);
 }

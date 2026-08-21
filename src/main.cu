@@ -194,39 +194,47 @@ int main (int argc, char *argv[])
     printf("  CPU: %.4f ms\n", cpu_histogram_ms);
     printf("  Speedup: %.2fx\n", cpu_histogram_ms / gpu_histogram_ms);
 
-    // sharpen kernel
-    printf("\nLaunching Sharpen kernel...\n"); fflush(stdout);
+    // Fuse small-image Sharpen and Edge to remove one launch and an intermediate
+    // global-memory round trip. Large images retain the tiled two-kernel path.
+    printf("\nLaunching Sharpen/Edge kernels...\n"); fflush(stdout);
+    float gpu_sharpen_ms = 0.0f;
+    float gpu_edge_ms = 0.0f;
     cudaEventRecord(start);
-    launchSharpen(A_out_histogram, A_out_sharpen, width, height);
-    cudaEventRecord(stop);
-    cudaEventSynchronize(stop);
-    cudaEventElapsedTime(&gpu_ms, start, stop);
-    float gpu_sharpen_ms = gpu_ms;
+    if ((size_t)width * (size_t)height < 2u * 1024u * 1024u) {
+        launchSharpenEdgeFused(A_out_histogram, A_out_sharpen, A_out_edge, width, height);
+        cudaEventRecord(stop);
+        cudaEventSynchronize(stop);
+        cudaEventElapsedTime(&gpu_ms, start, stop);
+        gpu_sharpen_ms = gpu_ms;
+    } else {
+        launchSharpen(A_out_histogram, A_out_sharpen, width, height);
+        cudaEventRecord(stop);
+        cudaEventSynchronize(stop);
+        cudaEventElapsedTime(&gpu_sharpen_ms, start, stop);
+        cudaEventRecord(start);
+        launchEdgeDetect(A_out_sharpen, A_out_edge, width, height);
+        cudaEventRecord(stop);
+        cudaEventSynchronize(stop);
+        cudaEventElapsedTime(&gpu_edge_ms, start, stop);
+    }
+    gpu_ms = gpu_sharpen_ms;
     if(cudaGetLastError() != cudaSuccess) fprintf(stderr, "Sharpen kernel launch error: %s\n", cudaGetErrorString(cudaGetLastError()));
 
     // cpu version
     double cpu_sharpen_ms = cpu_sharpen_opencv(argv[1]);
-    printf("[Sharpen]\n");
+    printf("[Sharpen%s]\n", ((size_t)width * (size_t)height < 2u * 1024u * 1024u) ? " + Edge fused" : "");
     printf("  GPU: %.4f ms\n", gpu_ms);
     printf("  CPU: %.4f ms\n", cpu_sharpen_ms);
     printf("  Speedup: %.2fx\n", cpu_sharpen_ms / gpu_ms);
 
-    // edge detect kernel
-    printf("\nLaunching Edge Detect kernel...\n"); fflush(stdout);
-    cudaEventRecord(start);
-    launchEdgeDetect(A_out_sharpen, A_out_edge, width, height);
-    cudaEventRecord(stop);
-    cudaEventSynchronize(stop);
-    cudaEventElapsedTime(&gpu_ms, start, stop);
-    float gpu_edge_ms = gpu_ms;
     if(cudaGetLastError() != cudaSuccess) fprintf(stderr, "EdgeDetect kernel launch error: %s\n", cudaGetErrorString(cudaGetLastError()));
 
     // cpu version
     double cpu_edge_ms = cpu_edge_opencv(argv[1]);
-    printf("[Edge Detection]\n");
-    printf("  GPU: %.4f ms\n", gpu_ms);
+    printf("[Edge Detection%s]\n", ((size_t)width * (size_t)height < 2u * 1024u * 1024u) ? " fused above" : "");
+    printf("  GPU: %.4f ms\n", gpu_edge_ms);
     printf("  CPU: %.4f ms\n", cpu_edge_ms);
-    printf("  Speedup: %.2fx\n", cpu_edge_ms / gpu_ms);
+    printf("  Speedup: %.2fx\n", gpu_edge_ms > 0.0f ? cpu_edge_ms / gpu_edge_ms : 0.0f);
 
     
     cuda_ret = cudaDeviceSynchronize();

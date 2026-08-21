@@ -97,20 +97,26 @@ int main(int argc, char** argv) {
 
     gaussian_simple<<<blocks, threads>>>(input, gaussian, width, height);
     CUDA_CHECK(cudaDeviceSynchronize());
-        cudaEventRecord(start);
-        gaussian_simple<<<blocks, threads>>>(input, gaussian, width, height);
-        cudaEventRecord(stop);
-        cudaEventSynchronize(stop);
-        cudaEventElapsedTime(&elapsed, start, stop);
-        printf("[GPU1 Gaussian Blur] GPU: %.4f ms\n", elapsed);
+    cudaEventRecord(start);
+    gaussian_simple<<<blocks, threads>>>(input, gaussian, width, height);
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+    cudaEventElapsedTime(&elapsed, start, stop);
+    printf("[GPU1 Gaussian Blur] GPU: %.4f ms\n", elapsed);
     uint8_t* host_stage = (uint8_t*)malloc(bytes);
     CUDA_CHECK(cudaMemcpy(host_stage, gaussian, bytes, cudaMemcpyDeviceToHost)); save_stage("gaussian", width, height, host_stage);
 
     CUDA_CHECK(cudaMemset(histogram, 0, 256 * sizeof(unsigned int)));
     cudaEventRecord(start); histogram_simple<<<linear_blocks, 256>>>(gaussian, histogram, count); cudaEventRecord(stop); cudaEventSynchronize(stop); cudaEventElapsedTime(&elapsed, start, stop); float histogram_kernel_ms = elapsed;
     unsigned int host_histogram[256]; CUDA_CHECK(cudaMemcpy(host_histogram, histogram, sizeof(host_histogram), cudaMemcpyDeviceToHost));
-    int cumulative = 0, minimum = 0; for (int i = 0; i < 256; ++i) cumulative += (int)host_histogram[i];
-    cumulative = 0; for (int i = 0; i < 256; ++i) { cumulative += host_histogram[i]; if (cumulative > 0) { minimum = cumulative; break; } }
+    int cumulative = 0, minimum = 0;
+    for (int i = 0; i < 256; ++i) {
+        cumulative += host_histogram[i];
+        if (cumulative > 0) {
+            minimum = cumulative;
+            break;
+        }
+    }
     cumulative = 0; uint8_t host_lut[256]; for (int i = 0; i < 256; ++i) { cumulative += host_histogram[i]; host_lut[i] = (uint8_t)(count == minimum ? 0 : ((float)(cumulative - minimum) / (count - minimum)) * 255.0f); }
     CUDA_CHECK(cudaMemcpy(lut, host_lut, 256, cudaMemcpyHostToDevice));
     cudaEventRecord(start); equalize_simple<<<linear_blocks, 256>>>(gaussian, equalized, lut, count); cudaEventRecord(stop); cudaEventSynchronize(stop); cudaEventElapsedTime(&elapsed, start, stop); printf("[GPU1 Histogram Equalization] GPU: %.4f ms\n", histogram_kernel_ms + elapsed); CUDA_CHECK(cudaMemcpy(host_stage, equalized, bytes, cudaMemcpyDeviceToHost)); save_stage("histogram", width, height, host_stage);

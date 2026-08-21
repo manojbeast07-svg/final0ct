@@ -12,27 +12,37 @@ def parse_gpu_timing_output(output_text: str) -> Dict[str, float]:
 
     if output_text:
         text = output_text or ""
-        candidate_blocks = []
-        if "{" in text:
-            start = text.find("{")
-            end = text.rfind("}")
-            if start != -1 and end != -1 and end > start:
-                candidate_blocks.append(text[start : end + 1])
-            for match in re.finditer(r"\{.*?\}", text, re.DOTALL):
-                candidate_blocks.append(match.group(0))
-        for candidate in candidate_blocks:
+        decoder = json.JSONDecoder()
+        json_payloads = []
+        # Decode each balanced JSON object independently; repeated binary runs
+        # produce multiple reports in one captured stdout/stderr string.
+        offset = 0
+        while offset < len(text):
+            start = text.find("{", offset)
+            if start == -1:
+                break
             try:
-                payload = json.loads(candidate)
-            except (TypeError, ValueError, json.JSONDecodeError):
+                candidate, end = decoder.raw_decode(text[start:])
+            except json.JSONDecodeError:
+                offset = start + 1
                 continue
-            if isinstance(payload, dict):
+            if isinstance(candidate, dict):
+                json_payloads.append(candidate)
+            offset = start + end
+
+        for payload in reversed(json_payloads):
+            try:
                 gpu_payload = payload.get("gpu", {})
                 if isinstance(gpu_payload, dict):
                     for key in STAGE_KEYS + MEMORY_KEYS:
                         value = gpu_payload.get(key)
                         if value is not None:
                             parsed[key] = float(value)
-        if parsed:
+            except (TypeError, ValueError):
+                continue
+            if all(key in parsed for key in STAGE_KEYS):
+                break
+        if all(key in parsed for key in STAGE_KEYS):
             memory_device = re.search(r"Device allocation:\s*([0-9]+)\s*bytes", text)
             memory_pinned = re.search(r"Pinned host allocation:\s*([0-9]+)\s*bytes", text)
             if memory_device:

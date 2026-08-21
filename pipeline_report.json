@@ -1,20 +1,20 @@
 {
-  "cpu_mean_ms": 79.17713327333331,
+  "cpu_mean_ms": 55.48249996112039,
   "gpu1": {
-    "sharpen_ms": 0.164,
-    "edge_ms": 0.1837,
     "device_bytes": 3939280.0,
-    "histogram_ms": 0.44156666666666666,
-    "gaussian_ms": 0.021066666666666664,
+    "edge_ms": 0.1494,
+    "histogram_ms": 0.3801666666666667,
+    "sharpen_ms": 0.14743333333333333,
+    "gaussian_ms": 0.042,
     "sample_count": 3
   },
   "enhanced": {
-    "sharpen_ms": 0.0768,
-    "edge_ms": 0.029,
-    "pinned_host_bytes": 3938000.0,
     "device_bytes": 3151680.0,
-    "histogram_ms": 0.06546666666666666,
-    "gaussian_ms": 0.0174,
+    "pinned_host_bytes": 3938000.0,
+    "edge_ms": 0.11163333333333335,
+    "histogram_ms": 1.0523333333333333,
+    "sharpen_ms": 0.059699999999999996,
+    "gaussian_ms": 0.048966666666666665,
     "sample_count": 3
   },
   "metrics": {

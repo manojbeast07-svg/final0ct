@@ -46,6 +46,15 @@ def run_wsl_binary(exe_path, dest_dir, repeats=1):
     stats = []
     last_out = ''
     for i in range(repeats):
+        # copy the input to the dest_dir so we have a record of exactly what was passed
+        try:
+            label = Path(str(exe_path)).name
+        except Exception:
+            label = 'binary'
+        try:
+            shutil.copy(INPUT, dest_dir / f"input_used_by_{label}_{i}.jpg")
+        except Exception:
+            pass
         cmd = build_wsl_command(str(ROOT), str(INPUT), executable_path=str(exe_path), distro_name=get_default_wsl_distro())
         print('Running:', ' '.join(cmd))
         proc = subprocess.run(cmd, cwd=str(ROOT), capture_output=True, text=True)

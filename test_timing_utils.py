@@ -33,6 +33,19 @@ def test_parse_gpu_timing_output_from_legacy_format():
     assert parsed["pinned_host_bytes"] == 8765432.0
 
 
+def test_parse_timing_uses_last_complete_json_report():
+    sample = (
+        '{"gpu": {"gaussian_ms": 9.0, "histogram_ms": 8.0, "sharpen_ms": 7.0, "edge_ms": 6.0}}\n'
+        'logs between runs\n'
+        '{"gpu": {"gaussian_ms": 1.0, "histogram_ms": 2.0, "sharpen_ms": 3.0, "edge_ms": 4.0}}'
+    )
+    parsed = parse_gpu_timing_output(sample)
+    assert parsed["gaussian_ms"] == 1.0
+    assert parsed["histogram_ms"] == 2.0
+    assert parsed["sharpen_ms"] == 3.0
+    assert parsed["edge_ms"] == 4.0
+
+
 def test_summarize_gpu_comparison_includes_memory_info():
     gpu_stats = {
         'gaussian_ms': {'mean_ms': 1.0},

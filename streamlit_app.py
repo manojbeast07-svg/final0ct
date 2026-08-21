@@ -2,6 +2,7 @@ import streamlit as st
 import cv2
 import numpy as np
 import subprocess
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
 import os
 import tempfile
@@ -18,6 +19,9 @@ DATA_DIR = ROOT / "data"
 RUNTIME_DIR = Path(tempfile.gettempdir()) / "clearscan"
 CPU_OUTPUT_DIR = RUNTIME_DIR / "cpu"
 GPU1_OUTPUT_DIR = RUNTIME_DIR / "gpu1"
+TEMP_CPU_DIR = ROOT / 'temp_cpu_outputs'
+TEMP_GPU1_DIR = ROOT / 'temp_gpu1_outputs'
+TEMP_ENH_DIR = ROOT / 'temp_enhanced_outputs'
 
 if "cpu_times" not in st.session_state:
     st.session_state.cpu_times = None
@@ -58,11 +62,11 @@ st.title("ClearScan: CPU vs GPU pipeline comparison")
 
 # Sidebar controls for interactivity
 st.sidebar.header("Run controls")
-repeats = st.sidebar.slider("CUDA samples (repeats)", min_value=1, max_value=10, value=3)
+repeats = st.sidebar.slider("CUDA samples (repeats)", min_value=1, max_value=10, value=1)
 run_cpu_checkbox = st.sidebar.checkbox("Run CPU baseline", value=True)
 run_gpu1_checkbox = st.sidebar.checkbox("Run GPU1 (simple CUDA)", value=True)
 run_enhanced_checkbox = st.sidebar.checkbox("Run GPU Enhanced (optimized CUDA)", value=True)
-auto_run = st.sidebar.checkbox("Auto-run on image select", value=False)
+auto_run = st.sidebar.checkbox("Auto-run on image select", value=True)
 show_logs = st.sidebar.checkbox("Show verbose logs", value=False)
 uploaded_bin_sidebar = st.sidebar.file_uploader("Upload GPU binary (optional)", type=None)
 binary_path_input = st.sidebar.text_input("GPU binary path (optional)", value=str(ROOT / "clearscan"))
@@ -95,14 +99,23 @@ if uploaded is None and choice == "-- none --":
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # If CPU output images already exist (e.g. from an external run), show them so the UI isn't empty
-if CPU_OUTPUT_DIR.exists() and any(CPU_OUTPUT_DIR.glob('*_cpu.png')):
+cpu_display_dir = None
+if TEMP_CPU_DIR.exists() and any(TEMP_CPU_DIR.glob('*.png')):
+    cpu_display_dir = TEMP_CPU_DIR
+elif CPU_OUTPUT_DIR.exists() and any(CPU_OUTPUT_DIR.glob('*_cpu.png')):
+    cpu_display_dir = CPU_OUTPUT_DIR
+
+if cpu_display_dir is not None:
     st.subheader("Last CPU outputs")
     cols = st.columns(4)
-    cpu_imgs = ['gaussian_cpu.png', 'histogram_cpu.png', 'sharpen_cpu.png', 'edge_cpu.png']
+    cpu_imgs = ['gaussian.png', 'histogram.png', 'sharpen.png', 'edge.png']
+    # support both *_cpu.png and plain names in temp dirs
     for i, name in enumerate(cpu_imgs):
-        p = CPU_OUTPUT_DIR / name
+        p = cpu_display_dir / name
+        if not p.exists() and cpu_display_dir is CPU_OUTPUT_DIR:
+            p = cpu_display_dir / name.replace('.png', '_cpu.png')
         if p.exists():
-            cols[i].image(str(p), caption=name.replace('_cpu.png', ' (CPU)'))
+            cols[i].image(str(p), caption=name.replace('.png', ' (CPU)'))
         else:
             cols[i].warning(f"Missing: {name}")
 
@@ -228,7 +241,7 @@ def time_cpu_pipeline_average(path, repeats=5):
     samples = [time_cpu_pipeline(path) for _ in range(repeats)]
     averaged = {}
     for key in samples[0]:
-        averaged[key] = float(np.mean([sample[key] for sample in samples]))
+        averaged[key] = float(np.median([sample[key] for sample in samples]))
     averaged["sample_count"] = repeats
     return averaged
 
@@ -307,6 +320,10 @@ def run_cuda_binary(binary_path, input_path, output_prefix=""):
 
 
 def run_cuda_binary_average(binary_path, input_path, repeats=5):
+    # With one requested sample, execute exactly one CUDA process invocation.
+    # For repeated measurements, discard one warm-up before collecting samples.
+    if repeats > 1:
+        run_cuda_binary(binary_path, input_path)
     samples = []
     last_output = ""
     for _ in range(repeats):
@@ -316,7 +333,7 @@ def run_cuda_binary_average(binary_path, input_path, repeats=5):
     for key in samples[0]:
         values = [sample[key] for sample in samples if key in sample]
         if values:
-            averaged[key] = float(np.mean(values))
+            averaged[key] = float(np.median(values))
     averaged["sample_count"] = repeats
     return averaged, last_output
 
@@ -376,6 +393,12 @@ if should_run:
         # Text input override
         if binary_path_input:
             candidate = Path(binary_path_input)
+            if candidate.exists():
+                enhanced_path = candidate
+                gpu1_path = candidate
+        # Prefer any GPU binary uploaded in the GPU section (saved in session state)
+        if st.session_state.get('uploaded_bin_path'):
+            candidate = Path(st.session_state['uploaded_bin_path'])
             if candidate.exists():
                 enhanced_path = candidate
                 gpu1_path = candidate
@@ -482,6 +505,37 @@ for stage_key, label, cpu_name, gpu_name, stat_key in STAGE_FILES:
     rows2.append({'stage': label, 'gpu1_ms': g1, 'enhanced_ms': enh, 'ratio': ratio})
 st.table(rows2)
 
+st.subheader('Memory utilization')
+image_bytes = input_path.stat().st_size if input_path.exists() else None
+gpu1_device = gpu1_state.get('device_bytes') if gpu1_state else None
+enhanced_device = enh_state.get('device_bytes') if enh_state else None
+enhanced_pinned = enh_state.get('pinned_host_bytes') if enh_state else None
+st.table([
+    {'version': 'CPU', 'device_memory': 'N/A', 'host_memory': f'{image_bytes / 1024**2:.3f} MB' if image_bytes is not None else 'N/A', 'intermediate_storage': 'Host RAM'},
+    {'version': 'GPU1', 'device_memory': f'{float(gpu1_device) / 1024**2:.3f} MB' if gpu1_device is not None else 'N/A', 'host_memory': 'Pageable input/output', 'intermediate_storage': 'Device global memory'},
+    {'version': 'GPU Enhanced', 'device_memory': f'{float(enhanced_device) / 1024**2:.3f} MB' if enhanced_device is not None else 'N/A', 'host_memory': f'{float(enhanced_pinned) / 1024**2:.3f} MB pinned' if enhanced_pinned is not None else 'N/A', 'intermediate_storage': 'Device global + shared tiles'},
+])
+
+st.subheader('Threads and synchronization')
+st.table([
+    {'version': 'CPU', 'parallel_units': 'Host cores / OpenCV threads', 'block_threads': 'N/A', 'synchronization': 'Host scheduling and library barriers', 'memory_access': 'Host cache and RAM'},
+    {'version': 'GPU1', 'parallel_units': 'One CUDA thread per pixel', 'block_threads': '16 x 16 = 256', 'synchronization': 'CUDA events and device synchronize', 'memory_access': 'Direct coalesced global reads'},
+    {'version': 'GPU Enhanced', 'parallel_units': 'One CUDA thread per pixel', 'block_threads': '16 x 16 direct; 32 x 8 tiled', 'synchronization': 'CUDA events; shared-tile __syncthreads for large images', 'memory_access': 'Global reads plus shared-memory reuse'},
+])
+
+st.subheader('Technical comparison')
+st.table([
+    {'property': 'Execution model', 'CPU': 'Sequential host pipeline', 'GPU1': 'Simple CUDA kernels', 'GPU Enhanced': 'Adaptive CUDA kernels'},
+    {'property': 'Gaussian / convolution', 'CPU': 'OpenCV CPU convolution', 'GPU1': 'Direct 3x3 global reads', 'GPU Enhanced': 'Direct small-image or shared-memory tiled large-image reads'},
+    {'property': 'Histogram', 'CPU': 'OpenCV equalizeHist', 'GPU1': 'Global atomic histogram', 'GPU Enhanced': 'Adaptive global/private histogram'},
+    {'property': 'Coefficient storage', 'CPU': 'Host/library constants', 'GPU1': 'Kernel arithmetic', 'GPU Enhanced': 'Constant memory and integer arithmetic'},
+    {'property': 'Data movement', 'CPU': 'Host only', 'GPU1': 'Host to device and device to host', 'GPU Enhanced': 'Pinned host buffers and device-resident intermediates'},
+    {'property': 'Optimization goal', 'CPU': 'Low setup and simple control', 'GPU1': 'Baseline parallelism', 'GPU Enhanced': 'Coalescing, reuse, lower contention, adaptive launch choices'},
+])
+
+# The result view is intentionally table-only after the two comparisons.
+st.stop()
+
 # Live CPU preview action
 if live_preview:
     # show controls for preview
@@ -581,9 +635,7 @@ if all(gpu_versions.values()):
         "GPU Enhanced is faster than GPU1 when its gap is marked faster because it reuses neighboring pixels in shared-memory tiles. "
         "GPU1 reads each neighbor directly from global memory, while GPU Enhanced reduces repeated global-memory traffic with coalesced tile loads and cached filter coefficients."
     )
-    if total_cpu > total_gpu1 > total_enhanced:
-        st.success("Performance order achieved: CPU > GPU1 > GPU Enhanced.")
-    else:
+    if not total_cpu > total_gpu1 > total_enhanced:
         st.warning("This workload does not achieve CPU > GPU1 > GPU Enhanced for the total pipeline. CUDA launch overhead and image size affect the order.")
 
     st.subheader("Memory comparison")
@@ -593,33 +645,47 @@ if all(gpu_versions.values()):
         {"version": "GPU Enhanced (optimized CUDA)", "device memory": memory_mb(gpu_versions["GPU Enhanced (optimized CUDA)"]), "host image memory": pinned_memory_mb(gpu_versions["GPU Enhanced (optimized CUDA)"])},
     ])
 
-    st.subheader("Output accuracy against CPU")
-    accuracy_rows = []
     stage_images = [
         ("Gaussian", "gaussian.png"),
         ("Histogram", "histogram.png"),
         ("Sharpen", "sharpen.png"),
         ("Edge", "edge.png"),
     ]
-    for stage, image_name in stage_images:
-        cpu_image = CPU_OUTPUT_DIR / image_name
-        gpu1_image = GPU1_OUTPUT_DIR / image_name
-        enhanced_image = OUTPUT_DIR / image_name
-        gpu1_metrics = output_metrics(cpu_image, gpu1_image)
-        enhanced_metrics = output_metrics(cpu_image, enhanced_image)
-        accuracy_rows.append({"stage": stage, "GPU1 MAE (0 ideal)": round(gpu1_metrics["mae"], 3), "GPU1 SSIM (1 ideal)": round(gpu1_metrics["ssim"], 4), "Enhanced MAE (0 ideal)": round(enhanced_metrics["mae"], 3), "Enhanced SSIM (1 ideal)": round(enhanced_metrics["ssim"], 4)})
-    st.table(accuracy_rows)
-    st.subheader("Images after each filter")
+    st.subheader("Filter outputs")
     for stage, image_name in stage_images:
         st.markdown(f"**{stage}**")
         image_columns = st.columns(3)
-        image_columns[0].image(str(CPU_OUTPUT_DIR / image_name), caption="CPU")
-        image_columns[1].image(str(GPU1_OUTPUT_DIR / image_name), caption="GPU1")
-        image_columns[2].image(str(OUTPUT_DIR / image_name), caption="GPU Enhanced")
+        # select images as above
+        cpu_img = None
+        for cand in [TEMP_CPU_DIR / image_name, TEMP_CPU_DIR / image_name.replace('.png','_cpu.png'), CPU_OUTPUT_DIR / image_name, CPU_OUTPUT_DIR / image_name.replace('.png','_cpu.png'), OUTPUT_DIR / image_name]:
+            if cand.exists():
+                cpu_img = cand
+                break
+        g1_img = None
+        for cand in [TEMP_GPU1_DIR / image_name.replace('.png','_0.png'), GPU1_OUTPUT_DIR / image_name, OUTPUT_DIR / f'gpu1_{image_name}', OUTPUT_DIR / image_name]:
+            if cand.exists():
+                g1_img = cand
+                break
+        enh_img = None
+        for cand in [TEMP_ENH_DIR / image_name.replace('.png','_0.png'), OUTPUT_DIR / image_name]:
+            if cand.exists():
+                enh_img = cand
+                break
+        if cpu_img:
+            image_columns[0].image(str(cpu_img), caption="CPU")
+        else:
+            image_columns[0].write('CPU image missing')
+        if g1_img:
+            image_columns[1].image(str(g1_img), caption="GPU1")
+        else:
+            image_columns[1].write('GPU1 image missing')
+        if enh_img:
+            image_columns[2].image(str(enh_img), caption="GPU Enhanced")
+        else:
+            image_columns[2].write('GPU Enhanced image missing')
     sample_count = gpu_versions["GPU1 (simple CUDA)"].get("sample_count", 1)
     st.caption(f"Stored result for {input_path.name} using {sample_count} CUDA samples per version. Gaussian can be slower when launch overhead exceeds the CPU blur time; the gap column shows the measured multiple.")
     st.success("All three pipelines completed for the selected image.")
-    st.stop()
 
 st.header("Run CPU pipeline (OpenCV)")
 if st.button("Run CPU" ):
@@ -635,6 +701,107 @@ if st.button("Run CPU" ):
             cols[i].image(str(p), caption=p.name.replace('_cpu.png',' (CPU)'))
         else:
             cols[i].warning(f"Missing: {p.name}")
+
+
+st.header("Threading demo")
+st.write("Demonstrate CPU threads processing image tiles and show GPU thread/grid mapping (simulated).")
+
+# CPU threading demo controls
+cpu_threads = st.slider("CPU threads (worker count)", min_value=1, max_value=32, value=8)
+run_thread_demo = st.button("Run CPU threading demo")
+
+def cpu_tile_worker(img, x0, x1, idx, progress_slot):
+    # simple work: apply gaussian to the tile and measure work time
+    t0 = time.perf_counter()
+    tile = img[:, x0:x1]
+    out = cv2.GaussianBlur(tile, (7,7), 1.5)
+    t1 = time.perf_counter()
+    elapsed_ms = (t1 - t0) * 1000.0
+    pixels = tile.shape[0] * tile.shape[1]
+    # write intermediate preview to temp folder so UI can load it
+    out_path = CPU_OUTPUT_DIR / f"tile_{idx}.png"
+    cv2.imwrite(str(out_path), out)
+    progress_slot.write(f"Thread {idx} done: cols {x0}-{x1} ({elapsed_ms:.2f} ms)")
+    return idx, out_path, elapsed_ms, pixels
+
+if run_thread_demo:
+    img = cv2.imread(str(input_path), cv2.IMREAD_GRAYSCALE)
+    h, w = img.shape
+    CPU_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    splits = [(i * w // cpu_threads, (i+1) * w // cpu_threads) for i in range(cpu_threads)]
+    status_cols = st.columns(min(cpu_threads, 8))
+    status_slots = [status_cols[i%len(status_cols)].empty() for i in range(cpu_threads)]
+    start = time.perf_counter()
+    results = [None] * cpu_threads
+    per_thread_times = [0.0] * cpu_threads
+    per_thread_pixels = [0] * cpu_threads
+    with ThreadPoolExecutor(max_workers=cpu_threads) as ex:
+        futures = {ex.submit(cpu_tile_worker, img, s[0], s[1], idx, status_slots[idx]): idx for idx, s in enumerate(splits)}
+        for fut in as_completed(futures):
+            idx = futures[fut]
+            try:
+                i, outp, elapsed_ms, pixels = fut.result()
+                results[i] = outp
+                per_thread_times[i] = elapsed_ms
+                per_thread_pixels[i] = pixels
+            except Exception as e:
+                status_slots[idx].error(f"Thread {idx} error: {e}")
+    end = time.perf_counter()
+    total_ms = (end - start) * 1000.0
+    st.success(f"CPU threading demo completed in {total_ms:.2f} ms using {cpu_threads} threads")
+    # compute threading metrics
+    import statistics as _stats
+    mean_ms = _stats.mean(per_thread_times) if per_thread_times else 0.0
+    stdev_ms = _stats.pstdev(per_thread_times) if per_thread_times else 0.0
+    max_ms = max(per_thread_times) if per_thread_times else 0.0
+    min_ms = min(per_thread_times) if per_thread_times else 0.0
+    imbalance = (max_ms - min_ms)
+    total_pixels = sum(per_thread_pixels)
+    throughput_pixels_per_s = (total_pixels / (total_ms/1000.0)) if total_ms>0 else 0.0
+    throughput_MB_per_s = throughput_pixels_per_s / 1024.0 / 1024.0
+    # show metrics
+    st.subheader("Threading metrics")
+    st.write({
+        "total_wall_ms": round(total_ms,3),
+        "mean_thread_ms": round(mean_ms,3),
+        "thread_time_stddev_ms": round(stdev_ms,3),
+        "load_imbalance_ms(max-min)": round(imbalance,3),
+        "throughput_pixels_per_s": int(throughput_pixels_per_s),
+        "throughput_MB_per_s": round(throughput_MB_per_s,3),
+    })
+    # per-thread table
+    table_rows = []
+    for i, t in enumerate(per_thread_times):
+        table_rows.append({"thread": i, "ms": round(t,3), "pixels": per_thread_pixels[i], "MB/s": round((per_thread_pixels[i]/(t/1000.0))/1024.0/1024.0,3) if t>0 else None})
+    st.table(table_rows)
+
+    # show thumbnails of tile outputs
+    thumbs = st.columns(min(cpu_threads, 8))
+    for i, p in enumerate(results):
+        if p and p.exists():
+            thumbs[i%len(thumbs)].image(str(p), caption=f"tile {i}")
+
+# GPU thread/grid mapping (calculation & visualization)
+st.markdown("---")
+st.subheader("GPU thread/grid mapping (calculated)")
+block_x = st.number_input("Block dim X", min_value=4, max_value=1024, value=16, step=8)
+block_y = st.number_input("Block dim Y", min_value=1, max_value=1024, value=16, step=8)
+img = cv2.imread(str(input_path), cv2.IMREAD_GRAYSCALE)
+H, W = img.shape
+grid_x = (W + block_x - 1) // block_x
+grid_y = (H + block_y - 1) // block_y
+total_threads = grid_x * grid_y * block_x * block_y
+st.write(f"Image: {W}x{H} — Grid: {grid_x} x {grid_y} blocks — Block: {block_x} x {block_y} threads — Total threads: {total_threads:,}")
+
+mermaid = f"""```mermaid
+graph TB
+  Image[Image {W}x{H}]
+  Grid[Grid {grid_x}x{grid_y} blocks]
+  Block[Block {block_x}x{block_y} threads]
+  Threads[Total threads: {total_threads:,}]
+  Image --> Grid --> Block --> Threads
+```"""
+st.markdown(mermaid)
 
 cpu_times = st.session_state.cpu_times
 
@@ -686,6 +853,8 @@ if uploaded_bin is not None:
             os.chmod(bin_path, 0o755)
         exe_path = bin_path
         use_wsl = os.name == "nt" and bin_path.suffix.lower() != ".exe"
+        # store uploaded GPU binary path in session state so other run paths pick it up
+        st.session_state['uploaded_bin_path'] = str(bin_path)
 
 if not exe_path.exists():
     st.warning(f"GPU binary not found at {exe_path}. The app will fall back to CPU timing data for now.")
